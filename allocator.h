@@ -39,28 +39,28 @@ void Enj_Free(Enj_Allocator *a, void *p);
 
 
 void Enj_InitBumpAllocator(
-    Enj_Allocator *a, 
+    Enj_Allocator *a,
     Enj_BumpAllocatorData *d,
-    void *buffer, 
+    void *buffer,
     size_t size);
 
 void Enj_InitStackAllocator(
-    Enj_Allocator *a, 
+    Enj_Allocator *a,
     Enj_StackAllocatorData *d,
-    void *buffer, 
+    void *buffer,
     size_t size);
 
 void Enj_InitPoolAllocator(
-    Enj_Allocator *a, 
+    Enj_Allocator *a,
     Enj_PoolAllocatorData *d,
-    void *buffer, 
+    void *buffer,
     size_t size,
     size_t chunksize);
 
 void Enj_InitHeapAllocator(
-    Enj_Allocator *a, 
+    Enj_Allocator *a,
     Enj_HeapAllocatorData *d,
-    void *buffer, 
+    void *buffer,
     size_t size);
 
 #ifdef __cplusplus

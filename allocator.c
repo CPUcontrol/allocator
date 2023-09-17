@@ -26,9 +26,9 @@ void Enj_Free(Enj_Allocator *a, void *p){
 }
 
 void Enj_InitBumpAllocator(
-    Enj_Allocator *a, 
+    Enj_Allocator *a,
     Enj_BumpAllocatorData *d,
-    void *buffer, 
+    void *buffer,
     size_t size){
     a->alloc = &bump_acate;
     a->dealloc = &bump_decate;
@@ -39,9 +39,9 @@ void Enj_InitBumpAllocator(
 }
 
 void Enj_InitStackAllocator(
-    Enj_Allocator *a, 
+    Enj_Allocator *a,
     Enj_StackAllocatorData *d,
-    void *buffer, 
+    void *buffer,
     size_t size){
     a->alloc = &stack_acate;
     a->dealloc = &stack_decate;
@@ -52,9 +52,9 @@ void Enj_InitStackAllocator(
 }
 
 void Enj_InitPoolAllocator(
-    Enj_Allocator *a, 
+    Enj_Allocator *a,
     Enj_PoolAllocatorData *d,
-    void *buffer, 
+    void *buffer,
     size_t size,
     size_t chunksize){
 
@@ -62,12 +62,12 @@ void Enj_InitPoolAllocator(
 
     char *i;
     char *end;
-    
+
     a->alloc = &pool_acate;
     a->dealloc = &pool_decate;
     a->data = d;
 
-    /*chunksize at least 16 for pointer alignment*/
+    /*chunksize at least twice pointer size for pointer alignment*/
     align = chunksize <= 2*sizeof(void *) ?
         ROUND_PTR(chunksize) :
         chunksize;
@@ -89,7 +89,7 @@ void Enj_InitPoolAllocator(
     /*Iterate over all chunks, adding the next one to free list*/
     /*Pointer is aligned in chunk by rounding up*/
     while(i <= end){
-        *(void **)((char *)d->free + ROUND_PTR(i-(char *)d->free)) 
+        *(void **)((char *)d->free + ROUND_PTR(i-(char *)d->free))
             = (void *)(i + align);
         i = i + align;
     }
@@ -108,22 +108,25 @@ typedef struct heap_free heap_free;
 struct heap_free{
     heap_header header;
 
-    heap_free *left;
-    heap_free *right;
+    heap_free *chs[2]; /*Indices 0, 1 mean left, right children*/
     heap_free *parent;
+
+    /*Either NULL or points to double-linked list*/
+    /*Points to self instead if part of list*/
+    heap_free *duplist;
 };
 
 void Enj_InitHeapAllocator(
-    Enj_Allocator *a, 
+    Enj_Allocator *a,
     Enj_HeapAllocatorData *d,
-    void *buffer, 
+    void *buffer,
     size_t size){
 
     size_t space;
 
     heap_free *r;
     heap_header *end;
-    
+
     a->alloc = &heap_acate;
     a->dealloc = &heap_decate;
     a->data = d;
@@ -133,7 +136,7 @@ void Enj_InitHeapAllocator(
 
     space = ROUNDDOWN(size, ALIGN_SIZE);
     /*Stop if not enough space*/
-    if(space < 
+    if(space <
       ROUNDUP(sizeof(heap_free), ALIGN_SIZE)
     + ROUNDUP(sizeof(heap_header), ALIGN_SIZE)
     ){
@@ -145,38 +148,39 @@ void Enj_InitHeapAllocator(
 
     r = (heap_free *)d->root;
 
-    
 
-    end = (heap_header *)((char *)buffer 
+
+    end = (heap_header *)((char *)buffer
         + ROUNDDOWN(
-        size - sizeof(heap_header), 
+        size - sizeof(heap_header),
         ALIGN_SIZE));
 
     r->header.prev_alloc = 0;
-    r->header.next_color = 
-        ROUNDDOWN(size - sizeof(heap_header), 
+    r->header.next_color =
+        ROUNDDOWN(size - sizeof(heap_header),
                 ALIGN_SIZE);
-    r->left = NULL;
-    r->right = NULL;
+    r->chs[0] = NULL;
+    r->chs[1] = NULL;
     r->parent = NULL;
+    r->duplist = NULL;
 
-    end->prev_alloc = ROUNDDOWN(size - sizeof(heap_header), 
+    end->prev_alloc = ROUNDDOWN(size - sizeof(heap_header),
                 ALIGN_SIZE) | 1;
-    end->next_color = 0; 
-    
+    end->next_color = 0;
+
 
 }
 
 static void * bump_acate(size_t size, void *data){
     Enj_BumpAllocatorData *stack = (Enj_BumpAllocatorData *)data;
-    
-    /*Round up added size - this works because ALIGN_SIZE is power of 2*/
+
+    /*Round up added size*/
     size_t roundupsize = (size + ALIGN_SIZE - 1) / ALIGN_SIZE * ALIGN_SIZE;
 
     void *res;
 
     /*Check if enough room*/
-    if((char *)stack->head  + roundupsize 
+    if((char *)stack->head  + roundupsize
     > (char *)stack->start + stack->size){
         return NULL;
     }
@@ -194,14 +198,14 @@ static void bump_decate(void *p, void *data){
 
 static void * stack_acate(size_t size, void *data){
     Enj_StackAllocatorData *stack = (Enj_StackAllocatorData *)data;
-    
-    /*Round up added size - this works because ALIGN_SIZE is power of 2*/
+
+    /*Round up added size*/
     size_t roundupsize = (size + ALIGN_SIZE - 1) / ALIGN_SIZE * ALIGN_SIZE;
 
     void *res;
 
     /*Check if enough room*/
-    if((char *)stack->head + roundupsize 
+    if((char *)stack->head + roundupsize
     > (char *)stack->start + stack->size){
         return NULL;
     }
@@ -231,7 +235,7 @@ static void * pool_acate(size_t size, void *data){
     }
 
     res = pool->free;
-    pool->free = *(void **)((char *)pool->start 
+    pool->free = *(void **)((char *)pool->start
     + ROUND_PTR((char *)pool->free - (char *)pool->start));
 
     return res;
@@ -252,62 +256,21 @@ static void pool_decate(void *p, void *data){
 
 /*RB Tree and heap stuff*/
 
-static heap_free * freeuncle(heap_free *f){
-    heap_free *p = f->parent;
-    heap_free *gp = p->parent;
+static void freerotate(Enj_HeapAllocatorData *h, heap_free *f, int dir){
+    heap_free *c = f->chs[1 ^ dir];
 
-    size_t memboff = 
-        p == gp->left 
-        ? offsetof(heap_free, right) 
-        : offsetof(heap_free, left);
-
-    return *(heap_free **)((char *)gp + memboff);
-}
-
-static void freerotateleft(Enj_HeapAllocatorData* h, heap_free *f){
-    heap_free *c = f->right;
-    
     if (f->parent) {
-
-        size_t memboff = 
-            f->parent->left == f
-            ? offsetof(heap_free, left) 
-            : offsetof(heap_free, right);
-
-        *(heap_free **)((char *)f->parent + memboff) = c;
+        f->parent->chs[f->parent->chs[1] == f] = c;
     }
     else h->root = c;
 
     c->parent = f->parent;
 
-    f->right = c->left;
-    if(c->left) c->left->parent = f;
-
-    f->parent = c; 
-    c->left = f;
-}
-
-static void freerotateright(Enj_HeapAllocatorData* h, heap_free *f){
-    heap_free *c = f->left;
-
-    if (f->parent) {
-
-        size_t memboff = 
-            f->parent->left == f
-            ? offsetof(heap_free, left) 
-            : offsetof(heap_free, right);
-
-        *(heap_free **)((char *)f->parent + memboff) = c;
-    }
-    else h->root = c;
-
-    c->parent = f->parent;
-
-    f->left = c->right;
-    if(c->right) c->right->parent = f;
+    f->chs[1 ^ dir] = c->chs[dir];
+    if(c->chs[dir]) c->chs[dir]->parent = f;
 
     f->parent = c;
-    c->right = f;
+    c->chs[dir] = f;
 }
 
 static heap_free * findbestfree(Enj_HeapAllocatorData *h, size_t size){
@@ -322,240 +285,202 @@ static heap_free * findbestfree(Enj_HeapAllocatorData *h, size_t size){
         }
         else if (space > size){
             best = it;
-            it = it->left;
+            it = it->chs[0];
         }
         else{
-            it = it->right;
+            it = it->chs[1];
         }
     }
 
     return best;
 }
-static void removefree(Enj_HeapAllocatorData *h, heap_free *f){
+
+static void removefree_tree(Enj_HeapAllocatorData *h, heap_free *f){
 
     heap_free placeholder;
     heap_free *db;
-    unsigned char childmask;
 
     heap_free *u;
 
-    if ((f == h->root) & (f->left == NULL) & (f->right == NULL)){
+    if (f->duplist){
+        /*Replace node from duplist instead of removing from tree*/
+        heap_free *replacement = f->duplist;
+
+        /*Update field of replacement with old node's tree state*/
+        replacement->duplist = replacement->chs[1];
+        replacement->parent = f->parent;
+        replacement->chs[0] = f->chs[0];
+        replacement->chs[1] = f->chs[1];
+        replacement->header.next_color =
+            (replacement->header.next_color & ~1)
+            | (f->header.next_color & 1);
+
+        /*Update other nodes in tree to point to replacement*/
+        if (f->parent) {
+            if(f == f->parent->chs[0]) f->parent->chs[0] = replacement;
+            else f->parent->chs[1] = replacement;
+        }
+        else {
+            h->root = replacement;
+        }
+        if (f->chs[0]) f->chs[0]->parent = replacement;
+        if (f->chs[1]) f->chs[1]->parent = replacement;
+
+        return;
+    }
+
+    if ((f == h->root) & (f->chs[0] == NULL) & (f->chs[1] == NULL)){
         h->root = NULL;
 
         return;
     }
 
 
-    
+
     placeholder.header.next_color = 0;
     placeholder.parent = NULL;
-    placeholder.left = NULL;
-    placeholder.right = NULL;
+    placeholder.chs[0] = NULL;
+    placeholder.chs[1] = NULL;
 
-    
-    /*Cases of how many children f has*/
-    /*if either node being removed or replacement node red, end early*/
-    childmask = (f->left != NULL)<<1 | (f->right != NULL);
-
-    /*No children*/
-    switch(childmask){
-    case 0:{
-        if(f->header.next_color & 1){
-            if(f->parent){
-                if(f == f->parent->left) f->parent->left = NULL;
-                else f->parent->right = NULL;
-            }
-
-            return;
-        }
-
-        db = &placeholder;
-
-        placeholder.parent = f->parent;
-        if(f->parent){
-            if(f == f->parent->left) f->parent->left = db;
-            else f->parent->right = db;
-
-        }
-
-
-    }
-    break;
-    /*Only right child*/
-    case 1:{
-        int red = (f->header.next_color | f->right->header.next_color) & 1;
-
-        db = f->right;
-
-        f->right->header.next_color &= ~1;
-
-        f->right->parent = f->parent;
-        if(f->parent){
-            if(f == f->parent->left) f->parent->left = f->right;
-            else f->parent->right = f->right;
-        }
-        else {
-            /*change root*/
-            h->root = f->right;
-        }
-
-        if(red) return;
-
-    }
-    break;
-    /*Only left child*/
-    case 2:{
-        int red = (f->header.next_color | f->left->header.next_color) & 1;
-
-        db = f->left;
-
-        f->left->header.next_color &= ~1;
-
-        f->left->parent = f->parent;
-        if(f->parent){
-            if(f == f->parent->left) f->parent->left = f->left;
-            else f->parent->right = f->left;
-        }
-        else {
-            /*change root*/
-            h->root = f->left;
-        }
-
-        if(red) return;
-
-    }
-    break;
     /*Both children*/
-    case 3:{
-        int red_succ;
-        heap_free* succparent;
-        heap_free* succright;
-
-        /*Replace f with inorder successor*/
-        heap_free *it = f->right;
-        while(it->left){
-            it = it->left;
+    if((f->chs[0] != NULL) & (f->chs[1] != NULL)){
+        int f_red;
+        int it_red;
+        heap_free *swap;
+        /*Exchange f with inorder successor*/
+        heap_free *it = f->chs[1];
+        while(it->chs[0]){
+            it = it->chs[0];
         }
-        red_succ = it->header.next_color & 1;
 
-        succparent = it->parent;
-        succright = it->right;
+        f_red = f->header.next_color & 1;
+        it_red = it->header.next_color & 1;
 
-        /*Make the it node new parent of f children*/
-        it->header.next_color = 
-            (it->header.next_color&~1) | (f->header.next_color&1);
+        it->header.next_color =
+            (it->header.next_color&~1) | f_red;
+        f->header.next_color =
+            (f->header.next_color&~1) | it_red;
 
-        it->parent = f->parent;
+        if (it->chs[0]) it->chs[0]->parent = f;
+        if (it->chs[1]) it->chs[1]->parent = f;
+        if (f->chs[0]) f->chs[0]->parent = it;
+        if (f->chs[1]) f->chs[1]->parent = it;
+
+        swap = it->chs[0];
+        it->chs[0] = f->chs[0];
+        f->chs[0] = swap;
+        swap = it->chs[1];
+        it->chs[1] = f->chs[1];
+        f->chs[1] = swap;
+
         if(f->parent){
-            if(f == f->parent->left) f->parent->left = it;
-            else f->parent->right = it;
+            if(f == f->parent->chs[0]) f->parent->chs[0] = it;
+            else f->parent->chs[1] = it;
         }
         else {
             /*change root*/
             h->root = it;
         }
 
-        
-        f->left->parent = it;
-        it->left = f->left;
-        /*Special case if successor is child of f node*/
-        if (f->right == it) {
-            if (red_succ) {
-                /*Nothing to do, successor was originally red*/
-                return;
-            }
+        if(it == it->parent->chs[0]) it->parent->chs[0] = f;
+        else it->parent->chs[1] = f;
 
-            if (it->right) {
-                db = it->right;
-                if (db->header.next_color & 1) {
-                    db->header.next_color &= ~1;
+        swap = it->parent;
+        it->parent = f->parent;
+        f->parent = swap;
 
-                    return;
-                };
-            }
-            else {
+    }
+    /*Only left child*/
+    if(f->chs[0] != NULL){
+        f->chs[0]->header.next_color &= ~1;
 
-                db = &placeholder;
-                placeholder.parent = it;
-                it->right = &placeholder;
-            }
+        f->chs[0]->parent = f->parent;
+        if(f->parent){
+            if(f == f->parent->chs[0]) f->parent->chs[0] = f->chs[0];
+            else f->parent->chs[1] = f->chs[0];
         }
         else {
-            f->right->parent = it;
-            it->right = f->right;
-
-            /*If right child exists, make that d-black, else the placeholder*/
-            if (succright) {
-                succright->parent = succparent;
-                succparent->left = succright;
-                if (red_succ) {
-                    return;
-                }
-
-                db = succright;
-                if (db->header.next_color & 1) {
-                    db->header.next_color &= ~1;
-
-                    return;
-                };
-            }
-            else{
-                if(red_succ){
-                    succparent->left = NULL;
-
-                    return;
-                }
-
-                db = &placeholder;
-                placeholder.parent = succparent;
-                succparent->left = &placeholder;
-            }
+            /*change root*/
+            h->root = f->chs[0];
         }
 
+        return;
     }
-    break;
+    /*Only right child*/
+    if(f->chs[1] != NULL){
+        f->chs[1]->header.next_color &= ~1;
+
+        f->chs[1]->parent = f->parent;
+        if(f->parent){
+            if(f == f->parent->chs[0]) f->parent->chs[0] = f->chs[1];
+            else f->parent->chs[1] = f->chs[1];
+        }
+        else {
+            /*change root*/
+            h->root = f->chs[1];
+        }
+
+        return;
     }
+    /*Zero children*/
+    if(f->header.next_color & 1){
+        if(f->parent){
+            if(f == f->parent->chs[0]) f->parent->chs[0] = NULL;
+            else f->parent->chs[1] = NULL;
+        }
+        else {
+            /*change root*/
+            h->root = NULL;
+        }
+
+        return;
+    }
+    else{
+        db = &placeholder;
+
+        db->parent = f->parent;
+        if(f->parent){
+            if(f == f->parent->chs[0]) f->parent->chs[0] = db;
+            else f->parent->chs[1] = db;
+        }
+    }
+
 
     /*Rotations*/
     u = db;
 
 
     for (;;) {
-        heap_free* s;
+        heap_free *s;
 
-        unsigned char sleft_red;
-        unsigned char sright_red;
+        int sleft_red;
+        int sright_red;
+        int u_side;
 
-        /*C1*/
+        /*C2*/
         if (!u->parent) break;
 
-        s = u == u->parent->right 
-                    ? u->parent->left : u->parent->right;
-        /*C2*/
+        u_side = (u == u->parent->chs[1]);
+        s = u->parent->chs[!u_side];
+
+        /*C3*/
         if (s->header.next_color & 1) {
             u->parent->header.next_color |= 1;
             s->header.next_color &= ~1;
-            if (u == u->parent->left) {
-                freerotateleft(h, u->parent);
-                s = u->parent->right;
-            }
-            else {
-                freerotateright(h, u->parent);
-                s = u->parent->left;
-            }
 
-            
+            freerotate(h, u->parent, u_side);
+            s = u->parent->chs[!u_side];
         }
 
         /*Check sibling children colors*/
-        sleft_red 
-            = s->left ? (s->left->header.next_color & 1) : 0;
-        sright_red 
-            = s->right ? (s->right->header.next_color & 1) : 0;
-        /*C3*/
-        if (!(u->parent->header.next_color & 1) & !(s->header.next_color & 1)
-            & !sleft_red 
-            & !sright_red) {
+        sleft_red
+            = s->chs[0] ? (s->chs[0]->header.next_color & 1) : 0;
+        sright_red
+            = s->chs[1] ? (s->chs[1]->header.next_color & 1) : 0;
+        /*C1*/
+        if ((~u->parent->header.next_color & 1) & (~s->header.next_color & 1)
+            & (1^sleft_red)
+            & (1^sright_red)) {
 
             s->header.next_color |= 1;
             u = u->parent;
@@ -564,9 +489,9 @@ static void removefree(Enj_HeapAllocatorData *h, heap_free *f){
             continue;
         }
         /*C4*/
-        if ((u->parent->header.next_color & 1) & !(s->header.next_color & 1)
-            & !sleft_red
-            & !sright_red) {
+        if ((u->parent->header.next_color & 1) & (~s->header.next_color & 1)
+            & (1^sleft_red)
+            & (1^sright_red)) {
 
             s->header.next_color |= 1;
             u->parent->header.next_color &= ~1;
@@ -574,54 +499,34 @@ static void removefree(Enj_HeapAllocatorData *h, heap_free *f){
             break;
         }
         /*C5*/
-        if (!(s->header.next_color & 1)) {
-            if ((u == u->parent->left) 
-                & !sright_red
-                & sleft_red) {
+        if ((~s->header.next_color & 1)) {
+            if ((!u_side ^ sright_red) & (u_side ^ sleft_red)) {
                 s->header.next_color |= 1;
-                s->left->header.next_color &= ~1;
+                s->chs[u_side]->header.next_color &= ~1;
 
-                freerotateright(h, s);
-
-                s = s->parent;
-            }
-            else if ((u == u->parent->right) 
-                & !sleft_red
-                & sright_red) {
-                s->header.next_color |= 1;
-                s->right->header.next_color &= ~1;
-
-                freerotateleft(h, s);
+                freerotate(h, s, !u_side);
 
                 s = s->parent;
             }
         }
-
-        s->header.next_color = (s->header.next_color & ~1) 
+        /*C6*/
+        s->header.next_color = (s->header.next_color & ~1)
             | (u->parent->header.next_color & 1);
         u->parent->header.next_color &= ~1;
 
-        if (u == u->parent->left) {
-            s->right->header.next_color &= ~1;
-            freerotateleft(h, u->parent);
-        }
-        else {
-            s->left->header.next_color &= ~1;
-            freerotateright(h, u->parent);
-        }
+        s->chs[!u_side]->header.next_color &= ~1;
+        freerotate(h, u->parent, u_side);
 
         break;
     }
-    
+
 
     /*Delete placeholder*/
-    if (placeholder.parent && placeholder.parent->left == &placeholder)
-        placeholder.parent->left = NULL;
-    else if (placeholder.parent && placeholder.parent->right == &placeholder)
-        placeholder.parent->right = NULL;
-
-
-
+    if (placeholder.parent) {
+        if (placeholder.parent->chs[0] == &placeholder)
+            placeholder.parent->chs[0] = NULL;
+        else placeholder.parent->chs[1] = NULL;
+    }
 }
 static void insertfree(Enj_HeapAllocatorData *h, heap_free *f){
 
@@ -632,92 +537,93 @@ static void insertfree(Enj_HeapAllocatorData *h, heap_free *f){
         h->root = f;
         f->header.next_color &= ~1;
         f->parent = NULL;
-        f->left = NULL;
-        f->right = NULL;
+        f->chs[0] = NULL;
+        f->chs[1] = NULL;
+        f->duplist = NULL;
         return;
     }
 
     it = (heap_free *)h->root;
-    space = (f->header.next_color & ~1)
-        /*- ROUNDUP(sizeof(heap_header), ALIGN_SIZE)*/;
+    space = f->header.next_color & ~1;
 
     for(;;){
-        size_t itspace = (it->header.next_color & ~1)
-            /*- ROUNDUP(sizeof(heap_header), ALIGN_SIZE)*/;
+        size_t itspace = it->header.next_color & ~1;
 
-        if(space <= itspace){
-            if (it->left){
-                it = it->left;
-            }
-            else{
-                it->left = f;
-                f->parent = it;
-                break;
-            }
+        if(space == itspace){
+            /*Insert into duplist instead of into tree*/
+
+            f->chs[0] = it;
+            f->chs[1] = it->duplist;
+            f->parent = NULL;
+            f->duplist = f;
+
+            if (it->duplist) it->duplist->chs[0] = f;
+
+            it->duplist = f;
+            return;
         }
         else{
-            if (it->right){
-                it = it->right;
+            if (it->chs[space > itspace]){
+                it = it->chs[space > itspace];
             }
             else{
-                it->right = f;
+                it->chs[space > itspace] = f;
                 f->parent = it;
                 break;
             }
         }
     }
 
-    f->left = NULL;
-    f->right = NULL;
+    f->chs[0] = NULL;
+    f->chs[1] = NULL;
+    f->duplist = NULL;
     f->header.next_color |= 1;
 
-    /*Case 1 already handles by root and case 2*/
     for(;;){
         if (!f->parent) {
-            /*Case 1*/
+            /*Case 3*/
             f->header.next_color &= ~1;
             break;
         }
-        else if(!(f->parent->header.next_color & 1)){
-            /*Case 2*/
+        else if((~f->parent->header.next_color & 1)){
+            /*Case 1*/
             break;
         }
         else{
-            heap_free *u = freeuncle(f);
-            if(u && (u->header.next_color & 1)){
-                /*Case 3*/
-                f->parent->header.next_color &= ~1;
-                u->header.next_color &= ~1;
-                f->parent->parent->header.next_color |= 1;
-
-                f = f->parent->parent;
+            heap_free *p = f->parent;
+            if(!p->parent){
+                /*Case 4*/
+                p->header.next_color &= ~1;
+                f->header.next_color |= 1;
+                break;
             }
             else{
-                /*Case 4*/
-                heap_free *p = f->parent;
-                heap_free *gp = f->parent->parent;
-                if((f == p->right) & (p == gp->left)){
-                    freerotateleft(h, p);
-                    f = p;
-                }
-                else if((f == p->left) & (p == gp->right)){
-                    freerotateright(h, p);
-                    f = p;
-                }
+                heap_free *gp = p->parent;
+                heap_free *u = gp->chs[p != gp->chs[1]];
+                if(u && (u->header.next_color & 1)){
+                    /*Case 2*/
+                    p->header.next_color &= ~1;
+                    u->header.next_color &= ~1;
+                    gp->header.next_color |= 1;
 
-                p = f->parent;
-                gp = f->parent->parent;
-
-                if(f == p->left){
-                    freerotateright(h, gp);
+                    f = gp;
                 }
                 else{
-                    freerotateleft(h, gp);
-                }
-                p->header.next_color &= ~1;
-                gp->header.next_color |= 1;
+                    /*Case 5 & 6*/
+                    if((f == p->chs[1]) ^ (p == gp->chs[1])){
+                        freerotate(h, p, p == gp->chs[1]);
+                        f = p;
+                    }
 
-                break;
+                    p = f->parent;
+                    gp = f->parent->parent;
+
+                    freerotate(h, gp, f != p->chs[1]);
+                    p->header.next_color &= ~1;
+                    gp->header.next_color |= 1;
+
+                    break;
+                }
             }
         }
 
@@ -725,6 +631,21 @@ static void insertfree(Enj_HeapAllocatorData *h, heap_free *f){
 
 }
 
+static void removefree(Enj_HeapAllocatorData *h, heap_free *f){
+    if(f->duplist == f){
+        /*Remove from duplist*/
+        heap_free *prev = f->chs[0];
+        heap_free *next = f->chs[1];
+        /*Head of duplist points back to tree node*/
+        if (prev->duplist == prev) prev->chs[1] = next;
+        else prev->duplist = next;
+
+        if (next) next->chs[0] = prev;
+    }
+    else{
+        removefree_tree(h, f);
+    }
+}
 
 static void * heap_acate(size_t size, void *data){
     Enj_HeapAllocatorData *heap = (Enj_HeapAllocatorData *)data;
@@ -749,33 +670,32 @@ static void * heap_acate(size_t size, void *data){
     if (minsize > sizeround) sizeround = minsize;
 
     bestfree = findbestfree(heap, sizeround);
-    
-    if(!bestfree) return NULL;
-    removefree(heap, bestfree);
 
+    if(!bestfree) return NULL;
+    removefree_tree(heap, bestfree);
     head = (heap_header *)bestfree;
     res = (void *)(
                 (char *)head + ROUNDUP(sizeof(heap_header),ALIGN_SIZE));
 
-    freespace = 
+    freespace =
         (head->next_color & ~1) - ROUNDUP(sizeof(heap_header),ALIGN_SIZE);
 
 
     if(freespace - sizeround > ROUNDUP(sizeof(heap_free),ALIGN_SIZE)){
         heap_free *newfree = (heap_free *)
             ((char *)res + sizeround);
-        
+
         /*Replace node in list with new free block*/
-        newfree->header.prev_alloc = 
+        newfree->header.prev_alloc =
             sizeround + ROUNDUP(sizeof(heap_header),ALIGN_SIZE);
-        newfree->header.next_color = 
-            head->next_color - sizeround 
+        newfree->header.next_color =
+            head->next_color - sizeround
             - ROUNDUP(sizeof(heap_header),ALIGN_SIZE);
 
         ((heap_header *)((char *)head + (head->next_color & ~1)))->prev_alloc
             -= sizeround + ROUNDUP(sizeof(heap_header), ALIGN_SIZE);
 
-        head->next_color = sizeround 
+        head->next_color = sizeround
             + ROUNDUP(sizeof(heap_header),ALIGN_SIZE);
 
 
@@ -784,7 +704,6 @@ static void * heap_acate(size_t size, void *data){
     /*Set block to allocated*/
     head->prev_alloc |= 1;
 
-    
     return res;
 
 }
@@ -797,7 +716,7 @@ static void heap_decate(void *p, void *data){
     heap = (Enj_HeapAllocatorData *)data;
     newfree = (heap_free *)
         ((char *)p - ROUNDUP(sizeof(heap_header), ALIGN_SIZE));
-    newfree->header.prev_alloc &= ~1;
+
     /*Check if next block is free to merge*/
     if (!(((heap_header *)
     ((char *)newfree + (newfree->header.next_color & ~1)))->prev_alloc & 1)){
@@ -806,7 +725,6 @@ static void heap_decate(void *p, void *data){
         heap_free *oldfree = (heap_free *)
             ((char *)newfree + (newfree->header.next_color & ~1));
         removefree(heap, oldfree);
-
         /*reconnect double list, bridging over oldfree*/
         newfree->header.next_color += oldfree->header.next_color & ~1;
         /*connect block right of oldfree to newfree*/
@@ -833,8 +751,7 @@ static void heap_decate(void *p, void *data){
         newfree = oldfree;
     }
 
-    
-    insertfree(heap, newfree); 
-    
+    newfree->header.prev_alloc &= ~1;
+    insertfree(heap, newfree);
     return;
 }
